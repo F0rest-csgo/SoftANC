@@ -1,5 +1,7 @@
 """SoftANC: experimental microphone polarity inversion, not calibrated ANC."""
 import math
+import json
+from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
 import sounddevice as sd
@@ -7,8 +9,11 @@ from dsp import Processor
 
 
 class App:
-    def __init__(self, root):
+    def __init__(self, root, config_path=None):
         self.root = root
+        self.config_path = Path(config_path) if config_path else Path(__file__).with_name('settings.json')
+        self.save_job = None
+        self.saved_devices = {}
         root.title('SoftANC · 低延迟反相实验台')
         root.geometry('860x810')
         root.minsize(780, 790)
@@ -75,7 +80,76 @@ class App:
         root.bind('<Escape>', lambda e: self.stop())
         root.protocol('WM_DELETE_WINDOW', self.close)
         self.refresh()
+        self.load_settings()
+        for widget in self.configs:
+            widget.bind('<<ComboboxSelected>>', self.settings_changed)
+        for variable in [self.gain, self.invert, self.exclusive, self.threshold, self.threshold_enabled]:
+            variable.trace_add('write', self.settings_changed)
         self.root.after(100, self.poll)
+
+    def device_key(self, widget, ids):
+        index = widget.current()
+        if index < 0 or index >= len(ids):
+            return None
+        device = self.devices[ids[index]]
+        return {'name': device['name'], 'api': self.apis[device['hostapi']]['name']}
+
+    def load_settings(self):
+        try:
+            if not self.config_path.exists():
+                return
+            data = json.loads(self.config_path.read_text(encoding='utf-8'))
+            if not isinstance(data, dict):
+                raise ValueError('配置必须是 JSON 对象')
+            for key, widget in [('rate', self.rate), ('block', self.block), ('delay', self.delay)]:
+                if data.get(key) in widget['values']:
+                    widget.set(data[key])
+            for key, var, low, high in [('gain', self.gain, 0, 100), ('threshold', self.threshold, -80, 0)]:
+                value = data.get(key)
+                if type(value) in (int, float) and math.isfinite(value) and low <= value <= high:
+                    var.set(value)
+            for key, var in [('invert', self.invert), ('exclusive', self.exclusive), ('threshold_enabled', self.threshold_enabled)]:
+                if type(data.get(key)) is bool:
+                    var.set(data[key])
+            missing = False
+            for key, widget, ids in [('input', self.inputs, self.in_ids), ('output', self.outputs, self.out_ids)]:
+                wanted = data.get(key)
+                if not isinstance(wanted, dict):
+                    continue
+                self.saved_devices[key] = wanted
+                match = next((n for n, i in enumerate(ids) if wanted == {'name': self.devices[i]['name'], 'api': self.apis[self.devices[i]['hostapi']]['name']}), None)
+                if match is None:
+                    widget.set('')
+                    missing = True
+                else:
+                    widget.current(match)
+            self.update_target()
+            self.update_threshold()
+            self.status.set('配置已恢复 · 保存的设备未连接，请重新选择' if missing else '配置已恢复 · 待机')
+        except (OSError, ValueError) as exc:
+            self.status.set(f'配置读取失败，使用默认设置：{exc}')
+
+    def settings_changed(self, *_):
+        self.update_target()
+        self.update_threshold()
+        if self.save_job is not None:
+            self.root.after_cancel(self.save_job)
+        self.save_job = self.root.after(350, self.save_settings)
+
+    def save_settings(self):
+        if self.save_job is not None:
+            self.root.after_cancel(self.save_job)
+            self.save_job = None
+        data = {key: var.get() for key, var in [('gain', self.gain), ('invert', self.invert), ('exclusive', self.exclusive), ('threshold', self.threshold), ('threshold_enabled', self.threshold_enabled)]}
+        data.update({key: widget.get() for key, widget in [('rate', self.rate), ('block', self.block), ('delay', self.delay)]})
+        for key, widget, ids in [('input', self.inputs, self.in_ids), ('output', self.outputs, self.out_ids)]:
+            data[key] = self.device_key(widget, ids) or self.saved_devices.get(key)
+        try:
+            temporary = self.config_path.with_suffix('.json.tmp')
+            temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
+            temporary.replace(self.config_path)
+        except (OSError, ValueError) as exc:
+            self.status.set(f'配置保存失败：{exc}')
 
     def combo(self, parent, row, label, values=()):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky='w', padx=(0, 15), pady=5)
@@ -87,6 +161,8 @@ class App:
 
     def refresh(self):
         try:
+            if hasattr(self, 'in_ids'):
+                self.save_settings()
             self.devices = sd.query_devices()
             self.apis = sd.query_hostapis()
             self.in_ids = [i for i, d in enumerate(self.devices) if d['max_input_channels']]
@@ -99,6 +175,8 @@ class App:
                     preferred = next((n for n, i in enumerate(ids) if self.devices[i]['name'] == default_name and 'WASAPI' in self.apis[self.devices[i]['hostapi']]['name']), next((n for n, i in enumerate(ids) if 'WASAPI' in self.apis[self.devices[i]['hostapi']]['name']), 0))
                     widget.current(preferred)
             self.status.set('待机 · 请选择麦克风和耳机；输入输出须使用相同音频后端')
+            if hasattr(self, 'in_ids') and self.config_path.exists():
+                self.load_settings()
         except Exception as exc:
             self.status.set(f'设备枚举失败：{exc}')
 
@@ -191,6 +269,7 @@ class App:
 
     def close(self):
         self.stop()
+        self.save_settings()
         self.root.destroy()
 
 
